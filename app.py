@@ -7,6 +7,11 @@ from pathlib import Path
 
 st.set_page_config(page_title="Deteksi Mata Juling", layout="centered")
 
+ROI_X_MIN_PCT = 0.2
+ROI_X_MAX_PCT = 0.8
+ROI_Y_MIN_PCT = 0.05
+ROI_Y_MAX_PCT = 0.9
+
 @st.cache_resource
 def load_models():
     base_dir = Path(__file__).resolve().parent
@@ -16,18 +21,47 @@ def load_models():
 
 @st.cache_resource
 def load_cascades():
-    # Load OpenCV face and eye detectors
     face_casc = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
     eye_casc = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
     return face_casc, eye_casc
+
+def draw_dashed_rect(img, pt1, pt2, color, thickness=2, dash_length=15):
+    x1, y1 = pt1
+    x2, y2 = pt2
+    for start in range(x1, x2, dash_length * 2):
+        end = min(start + dash_length, x2)
+        cv2.line(img, (start, y1), (end, y1), color, thickness)
+        cv2.line(img, (start, y2), (end, y2), color, thickness)
+    for start in range(y1, y2, dash_length * 2):
+        end = min(start + dash_length, y2)
+        cv2.line(img, (x1, start), (x1, end), color, thickness)
+        cv2.line(img, (x2, start), (x2, end), color, thickness)
+
+def create_guide_image(width=480, height=360):
+    guide = np.ones((height, width, 3), dtype=np.uint8) * 230
+    roi_x1 = int(ROI_X_MIN_PCT * width)
+    roi_y1 = int(ROI_Y_MIN_PCT * height)
+    roi_x2 = int(ROI_X_MAX_PCT * width)
+    roi_y2 = int(ROI_Y_MAX_PCT * height)
+    center = (width // 2, (roi_y1 + roi_y2) // 2)
+    axes_w = int((roi_x2 - roi_x1) * 0.4)
+    axes_h = int((roi_y2 - roi_y1) * 0.4)
+    cv2.ellipse(guide, center, (axes_w, axes_h), 0, 0, 360, (180, 180, 180), 2)
+    draw_dashed_rect(guide, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 200, 255), 2)
+    text = "Posisikan Wajah di Area Ini"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    text_size = cv2.getTextSize(text, font, 0.6, 2)[0]
+    text_x = (width - text_size[0]) // 2
+    cv2.putText(guide, text, (text_x, roi_y2 + 30), font, 0.6, (80, 80, 80), 2)
+    return guide
 
 st.title("Aplikasi Deteksi Mata Juling")
 st.markdown("""
 Aplikasi ini dapat mendeteksi kondisi **Mata Juling (Strabismus)** menggunakan model AI (YOLO).
 ### Cara Penggunaan:
-1. Pastikan wajah Anda berada di **tengah** dan menghadap **lurus** ke kamera.
+1. Pastikan wajah Anda berada di **area kotak kuning** dan menghadap **lurus** ke kamera.
 2. Klik tombol **Ambil Foto** (atau **Take Photo**).
-3. Sistem akan memvalidasi posisi wajah Anda. Jika kurang tepat, akan muncul peringatan.
+3. Sistem akan memvalidasi posisi wajah Anda terhadap area yang ditandai.
 4. Jika posisi tepat, hasil klasifikasi (Juling / Normal) akan ditampilkan.
 """)
 
@@ -38,6 +72,8 @@ source_option = st.radio("Pilih sumber gambar:", ("Kamera", "Upload Gambar"), ho
 
 input_image = None
 if source_option == "Kamera":
+    guide_img = create_guide_image()
+    st.image(guide_img, caption="Panduan posisi wajah - posisikan wajah Anda di area kotak kuning", use_container_width=True)
     input_image = st.camera_input("Ambil Foto Wajah Anda")
 elif source_option == "Upload Gambar":
     input_image = st.file_uploader("Upload Foto Wajah", type=['jpg', 'jpeg', 'png'])
@@ -45,51 +81,86 @@ elif source_option == "Upload Gambar":
         st.image(input_image, caption="Gambar yang Diupload", width=350)
 
 if input_image is not None:
-    # Convert uploaded image to OpenCV format
     pil_img = Image.open(input_image)
     frame = np.array(pil_img)
     
-    # st.camera_input returns RGB, OpenCV needs BGR for standard processing
     frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
     img_h, img_w, _ = frame_bgr.shape
     
-    # Detect face to check alignment
+    roi_x1 = int(ROI_X_MIN_PCT * img_w)
+    roi_y1 = int(ROI_Y_MIN_PCT * img_h)
+    roi_x2 = int(ROI_X_MAX_PCT * img_w)
+    roi_y2 = int(ROI_Y_MAX_PCT * img_h)
+    
+    roi_overlay = frame_bgr.copy()
+    roi_filled = roi_overlay.copy()
+    cv2.rectangle(roi_filled, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 255, 255), -1)
+    roi_overlay = cv2.addWeighted(roi_filled, 0.08, roi_overlay, 0.92, 0)
+    draw_dashed_rect(roi_overlay, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 255, 255), 2)
+    
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100))
     
     face_bbox = None
     is_valid_face = False
+    face_fits_roi = False
     
     if len(faces) == 0:
-        if source_option == "Kamera":
-            st.warning("⚠️ Wajah utuh tidak terdeteksi dengan jelas, namun gambar tetap diproses.")
-        # Fallback menggunakan keseluruhan gambar jika wajah tak terdeteksi
+        st.warning("⚠️ Wajah tidak terdeteksi! Pastikan wajah Anda terlihat jelas dan berada di area kotak kuning.")
         face_bbox = (0, 0, img_w, img_h)
     elif len(faces) > 1:
-        st.warning("⚠️ Terdeteksi lebih dari satu wajah! Menggunakan wajah terbesar.")
+        st.warning("⚠️ Terdeteksi lebih dari satu wajah! Pastikan hanya satu wajah di area kamera.")
         faces_sorted = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)
         face_bbox = faces_sorted[0]
         is_valid_face = True
     else:
         face_bbox = faces[0]
         is_valid_face = True
-        
-    if is_valid_face and source_option == "Kamera":
+    
+    if is_valid_face:
         x, y, w, h = face_bbox
         face_center_x = x + w / 2
         face_center_y = y + h / 2
         
-        safe_x_min, safe_x_max = int(0.3 * img_w), int(0.7 * img_w)
-        safe_y_min, safe_y_max = int(0.2 * img_h), int(0.8 * img_h)
+        face_in_roi = (x >= roi_x1) and (y >= roi_y1) and (x + w <= roi_x2) and (y + h <= roi_y2)
+        center_in_roi = (roi_x1 <= face_center_x <= roi_x2) and (roi_y1 <= face_center_y <= roi_y2)
+        face_fits_roi = face_in_roi or center_in_roi
         
-        is_centered = (safe_x_min <= face_center_x <= safe_x_max) and (safe_y_min <= face_center_y <= safe_y_max)
-        is_large_enough = (w > 0.15 * img_w)
+        cv2.rectangle(roi_overlay, (x, y), (x + w, y + h), (255, 255, 0), 2)
+        cv2.putText(roi_overlay, "Wajah", (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
         
-        if not is_centered:
-            st.warning("⚠️ Peringatan: Wajah Anda tidak di tengah! Untuk hasil lebih baik, luruskan wajah Anda.")
-        if not is_large_enough:
-            st.warning("⚠️ Peringatan: Wajah Anda terlalu jauh!")
-            
+        warnings = []
+        if not face_in_roi and not center_in_roi:
+            if face_center_x < roi_x1:
+                warnings.append("geser wajah ke **kanan**")
+            elif face_center_x > roi_x2:
+                warnings.append("geser wajah ke **kiri**")
+            if face_center_y < roi_y1:
+                warnings.append("geser wajah ke **bawah**")
+            elif face_center_y > roi_y2:
+                warnings.append("geser wajah ke **atas**")
+        elif not face_in_roi:
+            roi_w = roi_x2 - roi_x1
+            roi_h = roi_y2 - roi_y1
+            if w > roi_w or h > roi_h:
+                warnings.append("wajah terlalu dekat - **menjauhlah** sedikit")
+            else:
+                warnings.append("wajah tidak sepenuhnya di dalam area - **sesuaikan posisi** Anda")
+        
+        if w < 0.1 * img_w:
+            warnings.append("wajah terlalu jauh - **mendekatlah** ke kamera")
+        
+        if warnings:
+            msg = "⚠️ Wajah tidak pas di area yang ditandai: " + ", ".join(warnings) + "."
+            st.warning(msg)
+        else:
+            st.success("✅ Posisi wajah sudah tepat di area yang ditandai!")
+    
+    st.image(cv2.cvtColor(roi_overlay, cv2.COLOR_BGR2RGB), caption="Area ROI (kuning) & Posisi Wajah Terdeteksi", use_container_width=True)
+    
+    if not face_fits_roi and is_valid_face:
+        st.warning("⚠️ Hasil deteksi mungkin **kurang akurat** karena posisi wajah tidak optimal.")
+    
     # Tetap jalankan proses YOLO inference
     with st.spinner("Menganalisis gambar..."):
         # --- TAHAP 1: DETEKSI AREA MATA (Menggunakan model_mata.pt) ---
@@ -182,6 +253,10 @@ if input_image is not None:
             max_confidence = max(d['conf'] for d in list_mata_terdeteksi)
 
         # --- VISUALISASI ---
+        draw_dashed_rect(draw_img, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 255, 255), 1)
+        cv2.putText(draw_img, "ROI Wajah", (roi_x1 + 5, roi_y1 + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
         for d in list_mata_terdeteksi:
             x1, y1, x2, y2 = d['box']
             warna = (0, 0, 255) if status_pasien == "STRABISMUS (JULING)" else (0, 200, 0)
