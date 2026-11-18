@@ -5,6 +5,8 @@ from PIL import Image
 from ultralytics import YOLO
 from pathlib import Path
 
+from screening import NORMAL, STRABISMUS, Detection, decide, format_result
+
 st.set_page_config(page_title="Deteksi Mata Juling", layout="centered")
 
 ROI_X_MIN_PCT = 0.2
@@ -182,17 +184,20 @@ if input_image is not None:
                 y2 = min(img_h, ey + eh)
                 regions.append([x1, y1, x2, y2])
 
+        eye_regions_found = bool(regions)
+
         if not regions:
-            # Fallback: jika mata tidak terdeteksi sama sekali, gunakan area wajah atau gambar keseluruhan
+            # Tidak ada mata yang terdeteksi sama sekali. Stage 2 tetap
+            # dijalankan pada area wajah supaya pengguna melihat hasilnya,
+            # tetapi keputusan akhirnya INCONCLUSIVE, bukan NORMAL.
             if is_valid_face:
                 fx, fy, fw, fh = face_bbox
                 regions.append([fx, fy, fx+fw, fy+fh])
             else:
                 regions.append([0, 0, img_w, img_h])
 
-        status_pasien = "NORMAL"
-        max_confidence = 0.0
         list_mata_terdeteksi = []
+        detections = []
         draw_img = frame_bgr.copy()
 
         if regions:
@@ -214,67 +219,65 @@ if input_image is not None:
             # --- TAHAP 2: KLASIFIKASI PADA STRIP MATA ---
             results_cls = classifier.predict(strip_img, conf=0.5, verbose=False, device='cpu')
             
-            boxes = results_cls[0].boxes
-            if len(boxes) > 0:
-                for box in boxes:
-                    bx1, by1, bx2, by2 = box.xyxy[0].cpu().numpy().astype(int)
-                    class_id = int(box.cls[0])
-                    label_name = classifier.names[class_id].upper()
-                    conf_score = float(box.conf[0])
-                    
-                    # Kembalikan koordinat kotak ke ukuran gambar asli
-                    abs_x1 = bx1 + strip_x1
-                    abs_y1 = by1 + strip_y1
-                    abs_x2 = bx2 + strip_x1
-                    abs_y2 = by2 + strip_y1
-                    
-                    list_mata_terdeteksi.append({
-                        'box': [abs_x1, abs_y1, abs_x2, abs_y2],
-                        'label': label_name,
-                        'conf': conf_score
-                    })
-                    
-                    # LOGIKA UNILATERAL: 1 mata juling = STRABISMUS
-                    if "JULING" in label_name or "STRABISMUS" in label_name:
-                        status_pasien = "STRABISMUS (JULING)"
-                        if conf_score > max_confidence:
-                            max_confidence = conf_score
-            else:
-                # Fallback jika model_juling tidak mendeteksi apa-apa di dalam strip
-                for (rx1, ry1, rx2, ry2) in regions:
-                    list_mata_terdeteksi.append({
-                        'box': [rx1, ry1, rx2, ry2],
-                        'label': "NORMAL",
-                        'conf': 1.0
-                    })
+            for box in results_cls[0].boxes:
+                bx1, by1, bx2, by2 = box.xyxy[0].cpu().numpy().astype(int)
+                class_id = int(box.cls[0])
+                label_name = classifier.names[class_id].upper()
+                conf_score = float(box.conf[0])
+                
+                # Kembalikan koordinat kotak ke ukuran gambar asli
+                abs_x1 = bx1 + strip_x1
+                abs_y1 = by1 + strip_y1
+                abs_x2 = bx2 + strip_x1
+                abs_y2 = by2 + strip_y1
+                
+                list_mata_terdeteksi.append({
+                    'box': [abs_x1, abs_y1, abs_x2, abs_y2],
+                    'label': label_name,
+                    'conf': conf_score
+                })
+                detections.append(
+                    Detection(label_name, conf_score, (abs_x1, abs_y1, abs_x2, abs_y2))
+                )
 
-        # Ambil confidence tertinggi jika NORMAL
-        if status_pasien == "NORMAL" and list_mata_terdeteksi:
-            max_confidence = max(d['conf'] for d in list_mata_terdeteksi)
+        # Satu tempat yang memutuskan status. Tidak ada angka pengganti:
+        # kalau model tidak mengeluarkan kotak, hasilnya INCONCLUSIVE.
+        outcome = decide(detections, eye_regions_found=eye_regions_found)
 
         # --- VISUALISASI ---
         draw_dashed_rect(draw_img, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 255, 255), 1)
         cv2.putText(draw_img, "ROI Wajah", (roi_x1 + 5, roi_y1 + 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
+        if outcome.status == STRABISMUS:
+            warna = (0, 0, 255)
+        elif outcome.status == NORMAL:
+            warna = (0, 200, 0)
+        else:
+            warna = (0, 165, 255)
+
+        teks = format_result(outcome)
         for d in list_mata_terdeteksi:
             x1, y1, x2, y2 = d['box']
-            warna = (0, 0, 255) if status_pasien == "STRABISMUS (JULING)" else (0, 200, 0)
-
             cv2.rectangle(draw_img, (x1, y1), (x2, y2), warna, 3)
-            teks = f"{status_pasien} ({max_confidence:.2%})"
             cv2.putText(draw_img, teks, (x1, y1 - 10 if y1 > 10 else y1 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, warna, 2)
+
+        if not list_mata_terdeteksi:
+            cv2.putText(draw_img, teks, (roi_x1, max(roi_y2 + 30, 30)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, warna, 2)
 
         res_rgb = cv2.cvtColor(draw_img, cv2.COLOR_BGR2RGB)
         st.image(res_rgb, caption="Hasil Deteksi", use_container_width=True)
                 
         # Display textual results
-        if not list_mata_terdeteksi:
-            st.info("Area mata tidak ditemukan oleh detector.")
+        st.markdown("### Kesimpulan Deteksi:")
+        if outcome.status == STRABISMUS:
+            st.error(f"🔴 Terdeteksi **{outcome.status}** dengan tingkat keyakinan {outcome.confidence:.0%}")
+        elif outcome.status == NORMAL:
+            st.success(f"🟢 Terdeteksi **{outcome.status}** dengan tingkat keyakinan {outcome.confidence:.0%}")
         else:
-            st.markdown("### Kesimpulan Deteksi:")
-            if status_pasien == "STRABISMUS (JULING)":
-                st.error(f"🔴 Terdeteksi **{status_pasien}** dengan tingkat keyakinan {max_confidence:.0%}")
-            else:
-                st.success(f"🟢 Terdeteksi **{status_pasien}** dengan tingkat keyakinan {max_confidence:.0%}")
+            st.warning(
+                f"⚪ **{outcome.status}** — {outcome.reason}. "
+                "Sistem tidak memberi label normal hanya karena tidak menemukan apa pun."
+            )
