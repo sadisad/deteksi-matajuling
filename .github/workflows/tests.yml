@@ -1,0 +1,21 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  decision-layer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # screening.py is stdlib-only on purpose: the decision layer must be
+      # testable without model weights, a camera, or ultralytics installed.
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Import check on the front ends
+        run: python -m py_compile app.py main.py screening.py

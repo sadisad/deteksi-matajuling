@@ -11,7 +11,7 @@ A photo of a face goes through two models in sequence:
 1. **Eye detection** — `model_mata.pt` (YOLO) locates the eye regions in the frame.
 2. **Strabismus classification** — the detected eyes are merged into one horizontal strip, padded by 20 px, and `model_juling.pt` (YOLO) classifies that strip.
 
-If stage 1 finds nothing, the pipeline falls back to OpenCV's `haarcascade_eye.xml`, then to the whole frame. If stage 2 finds nothing inside the strip, the frame is reported as normal — which is one of the known problems listed below.
+If stage 1 finds nothing, the pipeline falls back to OpenCV's `haarcascade_eye.xml`, then to the whole frame. If stage 2 finds nothing inside the strip, the result is reported as **inconclusive** — not normal. See [How the decision is made](#how-the-decision-is-made).
 
 Two front ends share the same weights:
 
@@ -33,26 +33,54 @@ CPU only (`device='cpu'` in both scripts). On macOS and Linux, `main.py` needs a
 
 ## How the decision is made
 
-Stage 2 returns boxes with a class name and a confidence. If any box's class name contains `JULING` or `STRABISMUS`, the frame is labelled strabismus and the highest such confidence is shown. Otherwise the frame is labelled normal.
+The decision lives in `screening.py`, separate from the UI and from Ultralytics, so it can be tested without weights or a camera. `decide()` maps stage-2 detections onto one of three outcomes:
 
-That is a threshold on a single model's box confidence, not a calibrated probability, and there is no abstention. A frame the model finds confusing is reported as a confident answer.
+| Situation | Outcome | Confidence |
+| :--- | :--- | :--- |
+| Any box labelled `JULING` or `STRABISMUS` | `STRABISMUS (JULING)` | highest such box confidence |
+| Boxes, none of them strabismus | `NORMAL` | highest box confidence |
+| Stage 1 found no eyes (stage 2 ran on the fallback frame) | `TIDAK DAPAT DISIMPULKAN` | none |
+| Stage 2 returned zero boxes | `TIDAK DAPAT DISIMPULKAN` | none |
+
+The rule that matters: a model that produces no boxes has not said "normal", it has said nothing. Abstentions carry no number — `format_result()` returns the bare status string and never a percentage, because a percentage would imply a measurement that did not happen.
+
+```python
+from screening import Detection, decide, format_result
+
+decide([]).status                                  # 'TIDAK DAPAT DISIMPULKAN'
+decide([Detection("NORMAL", 0.87)]).status          # 'NORMAL'
+decide([Detection("NORMAL", 0.95),
+        Detection("JULING", 0.61)]).status          # 'STRABISMUS (JULING)'
+```
+
+Both front ends call this same function. `app.py` renders the inconclusive case as a warning with the reason; `main.py` shows it on the frame and raises a dialog.
+
+This is still a threshold on a single model's box confidence, not a calibrated probability — see the limitations below.
 
 ## Known limitations
 
 These are real and known. They are listed because a screening tool that hides them is worse than one that admits them.
 
-- **The normal path can report 100% confidence without measuring anything.** When stage 2 returns no boxes, the fallback assigns the label `NORMAL` with `conf = 1.0`, which the UI renders as "normal (100%)". The number is a placeholder, not a model output. `app.py` around the `Fallback jika model_juling tidak mendeteksi apa-apa` comment and the same block in `main.py`.
-- **A blank strip reads as normal.** Failure of stage 2 is treated as absence of strabismus, so a detection failure and a genuine negative look identical to the user.
-- **No calibration, no abstention, no "inconclusive".** The only outcomes are normal and strabismus. Compare with [LeafSentry AI](https://github.com/sadisad/leafsentry-ai), which is built the other way round.
+- **Confidence is uncalibrated.** A box score of 0.7 is a detector score, not the probability that the patient has strabismus. No temperature scaling, no reliability diagram, no decision threshold tuned against outcomes.
+- **The stage-2 score threshold is fixed at 0.5** in both front ends, chosen by hand and never validated.
+- **A detection failure and a genuine negative now look different, but both are still uninformative.** `INCONCLUSIVE` tells the user the model declined; it does not tell them whether the eye was present and normal or absent entirely.
 - **No recorded accuracy.** No evaluation set, no confusion matrix, and no held-out split ships with this repository. No number in this README would be honest, so none is given.
 - **Training is not reproducible from here.** `models/` contains three weight files (about 35 MB total) but no training script, no dataset manifest, and no split definitions.
 - **One face, front-facing.** The ROI gate rejects multiple faces; profile views and occlusions are untested.
-- **No tests and no CI.** There is nothing in the repository that fails when the pipeline regresses.
+- **Tests cover the decision layer only.** `tests/test_screening.py` runs nine cases over `decide()` and `format_result()` with no model involved, and CI runs them on every push. Nothing tests the models themselves: there is no fixture image whose expected label is asserted, so a weight swap that degrades accuracy would still pass.
 - **Not a replacement for a cover test.** Strabismus screening in practice involves more than one photograph at more than one gaze angle.
 
 ## What this project is useful for
 
-Reading it as a worked example of the gap between a model that answers and a pipeline that behaves. The fix list above is the interesting part: those are the same defects that show up in production screening systems, in a codebase small enough to read in one sitting.
+Reading it as a worked example of the gap between a model that answers and a pipeline that behaves. The commit history is the interesting part: the first version turned "no boxes" into "normal, 100% confident", which is the same defect that shows up in production screening systems, in a codebase small enough to read in one sitting. The fix was to give the pipeline a way to decline, and to write down the cases where it does.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Nine cases, no weights, no camera, no GPU. `.github/workflows/tests.yml` runs them on every push and pull request, plus a `py_compile` pass over the front ends.
 
 ## Stack
 
